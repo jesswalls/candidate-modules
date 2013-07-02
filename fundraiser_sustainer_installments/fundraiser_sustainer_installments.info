@@ -1,0 +1,6 @@
+name = Fundraiser Sustainer Installments
+description = Implements installment periods for sustainer donations.
+core = 7.x
+package = Jackson River Springboard
+version = 7.x-4.x-dev
+dependencies[] = fundraiser
