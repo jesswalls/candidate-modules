@@ -1,5 +1,5 @@
 <?php
-
+define('RECUR_SECONDS_WEEK', 604800);
 /**
  * @file
  * Implements installment periods for sustainer donations.
@@ -104,7 +104,8 @@ function fundraiser_sustainer_installments_module_implements_alter(&$implementat
 function fundraiser_sustainer_installments_fundraiser_donation_submit($form, $form_state, $donation) {
   //If donation was optionally recurring, check in form submit to correctly set the 'recurs_monthly' value based on the selected frequency (if any)
   if (empty($form_state['values']['submitted_tree']['payment_information']['period'])) {
-    unset($form_state['values']['submitted_tree']['payment_information']['recurs_monthly']);
+    //$form_state['values']['submitted_tree']['payment_information']['recurs_monthly'] = 'NO_RECURR';
+    $donation->recurs_monthly = FALSE;
   }
 }
 
@@ -257,6 +258,8 @@ function _fundraiser_sustainer_installments_create_future_orders($donation, $mon
 /**
  * Helper function to generate date schedule for future recurring payments
  *
+ * @return array of future recurring payment dates
+ * 
  * index by frequency time unit
  * need 'first' start date and length in terms of frequency
  * need total in terms of frequency
@@ -295,25 +298,27 @@ function _fundraiser_sustainer_installments_get_payment_schedule($month, $year, 
     case 'monthly':
       $interval = 'months';
       $step = 1;
+      $total_installments = $months;
       break;
     case 'quarterly' :
       $interval = 'months';
       $step = 3;
+      $total_installments = $months/3;//charged 4 times a year
       break;
     case 'yearly' :
       $interval = 'years';
       $step = 1;
-      $total_installments = $months/12;
+      $total_installments = $months/12;//at most the number of years til expiration 
       break;
     case 'weekly':
       $interval = 'weeks';
       $step = 1;
-      $total_installments = ($stop - $start)/(60*60*24*7);
+      $total_installments = ($stop - $start)/(RECUR_SECONDS_WEEK);//number of weeks from now til expiration
       break;
     case 'bi_monthly':
       $interval = 'months';
       $step = 1;
-      $total_installments = $months;
+      $total_installments = $months*2;//charged twice a month
       break;
     default:
       $interval = 'months';
@@ -324,18 +329,24 @@ function _fundraiser_sustainer_installments_get_payment_schedule($month, $year, 
   
   $create_limit = variable_get('fundraiser_sustainers_create_limit', 50);
   $processed_installments = 0;
+  $index = 1;
   $max_installments = min($create_limit, $total_installments);
   $schedule = array();
   while ($processed_installments < $max_installments) {
-    $processed_installments += $step;
+    $processed_installments ++;
     if ($frequency === 'bi_monthly') {
-      $schedule[$processed_installments] = strtotime('first day of +' . $processed_installments . ' months');
-      $processed_installments += $step;
-      $schedule[$processed_installments] = strtotime('+2 weeks', $schedule[$processed_installments - $step]);
+      $date_stamp = strtotime('+' . $index . ' months');
+      $new_month = idate('m', $date_stamp);
+      $new_year = idate('Y', $date_stamp);
+      $first = mktime(0, 0 ,0 , $new_month, 1, $new_year);//strtotime('first day of +' . $index . ' months'); (this doesn't work in php 5.2.17 and Drupal 7 doesn't require php 5.3)
+      $fifteenth = strtotime('+2 weeks', $first);
+      $schedule[$processed_installments++] = $first;
+      $schedule[$processed_installments] = $fifteenth;
     }
     else {
-      $schedule[$processed_installments] = strtotime('+ ' . $processed_installments . " $interval");
+      $schedule[$processed_installments] = strtotime('+ ' . $index . " $interval");
     }
+    $index += $step;
   }
   return $schedule;
 
