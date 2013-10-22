@@ -4,3 +4,339 @@
  * @file
  * Implements installment periods for sustainer donations.
  */
+
+/**
+ * Implements hook_fundraiser_field_info().
+ * Add payment frequency select options to donation form.
+ */
+function fundraiser_sustainer_installments_fundraiser_field_info() {
+ $formatted_options = _fundraiser_sustainer_installments_period_options();//grab the options for the select list
+ $fields['payment_information']['period'] = array(
+     '#title' => t('Recurring Payment Options'),
+     '#type' => 'select',
+     '#required' => 0,
+     '#allow_update' => 1,
+     '#allow_respawn' => 1,
+     '#reset_value' => 1,      
+     '#extra' => array(
+       'description' => t('If this option is selected, your credit card will be charged at the selected frequency until its expiration date.'),
+       'items' => $formatted_options,
+       'aslist' => TRUE,
+       'width' => 10,
+     ),
+     '#create_callback' => '_fundraiser_sustainer_installments_period_field_create'
+   );
+ return $fields;
+}
+
+/**
+ * Implements hook_fundraiser_field_info_alter.
+ */
+function fundraiser_sustainer_installments_fundraiser_field_info_alter(&$info) {
+  //Alter the create_callback for the fundraiser_sustainers monthly recurring field--we don't want it to display, but need the field to still be present.
+ $info['payment_information']['recurs_monthly']['#create_callback'] = '_fundraiser_sustainer_installments_recurs_field_create';
+}
+
+/**
+ * create callback for sustainer installments period select field
+ */
+function _fundraiser_sustainer_installments_period_field_create($fundraiser, $field) {
+ //piggyback on the existing recurring settings
+ if (empty($fundraiser->recurring_setting)) {
+   return FALSE;
+ }
+ if ($fundraiser->recurring_setting == 'always') {
+   $field['#required'] = TRUE;
+ }
+ return $field;
+}
+
+/**
+ * Override the fundraiser sustainers create callback to always hide the field if donation is configured for recurring billing
+ */
+function _fundraiser_sustainer_installments_recurs_field_create($fundraiser, $field) {
+ if (!empty($fundraiser->recurring_setting) && $fundraiser->recurring_setting !== 'never') {
+   $field['#type'] = 'hidden';
+   $field['#extra'] = array(
+     'description' => '',
+     'hidden_type' => 'hidden',
+   );
+   $field['#value'] = 'recurs';
+   return $field;
+ }
+ else {
+   return FALSE;
+ }
+ //return _fundraiser_sustainers_recurs_monthly_field_create($fundraiser, $field);
+}
+
+/**
+ * Helper function to format the installment options for the recurring select field
+ */
+function _fundraiser_sustainer_installments_period_options() {
+ $options = array(
+   'monthly' => t('Monthly'),
+   'quarterly' => t('Quarterly'),
+   'yearly' => t('Yearly'),
+   'weekly' => t('Weekly'),
+   'bi_monthly' => t('1st and 15th'),
+ );
+ $formatted_options = '';
+ foreach ($options as $value => $label) {
+   $formatted_options .= "$value|$label\n";
+ }
+ return $formatted_options;
+}
+
+/**
+ * Implements hook_module_implements_alter.
+ * 
+ */
+function fundraiser_sustainer_installments_module_implements_alter(&$implementations, $hook) {
+  if ($hook === 'fundraiser_donation_success') {
+    unset($implementations['fundraiser_sustainers']);//to allow recurring periods other than 'monthly' we need to bypass the existing logic in fundraiser_sustainers
+  }
+}
+
+/**
+* Implements hook_fundraiser_donation_submit().
+*/
+function fundraiser_sustainer_installments_fundraiser_donation_submit($form, $form_state, $donation) {
+  //If donation was optionally recurring, check in form submit to correctly set the 'recurs_monthly' value based on the selected frequency (if any)
+  if (empty($form_state['values']['submitted_tree']['payment_information']['period'])) {
+    unset($form_state['values']['submitted_tree']['payment_information']['recurs_monthly']);
+  }
+}
+
+/**
+ * Implements hook_fundraiser_donation_success().
+ * verbatim copy of fundraiser_sustainer's hook with the exception of the replacement of the create_future_orders call
+ */
+function fundraiser_sustainer_installments_fundraiser_donation_success($donation) {
+  // If we don't have a master id already set, check if this is a new recurring order.
+  if (!isset($donation->recurring->master_did)) {
+    // If this is in fact a recurring donation, then we act.
+    if ($donation->donation['recurs_monthly'] == TRUE) {
+      $info = _fundraiser_get_donation_gateway($donation->did);
+      if (_fundraiser_sustainers_supports_recurring($info['allow_recurring'], $donation->donation['payment_method'])) { // Allows recurring
+        // Then we do all the creating of offline values, table, SF object, and extra orders.
+        $donation->recurring = new stdClass();
+        $donation->recurring->master_did = $donation->did;
+        // Add the master to the recurring table.
+        $recurring_donation = array(
+          'did' => $donation->did,
+          'master_did' => $donation->did,
+          'next_charge' => strtotime('now'),
+          'gateway_resp' => 'success',
+          'attempts' => 1,
+        );
+        // Update the recurring table.
+        _fundraiser_sustainers_create_recurring($recurring_donation);
+        // Now handle the recurring object, and the rest of the orders.
+        if (!_fundraiser_sustainers_offsite_recurring($info['offsite_recurring'], $donation->donation['payment_method'])) { // Is not an offline recurring
+          // Load the newly created recurring donation into salesforce.
+          if (module_exists('salesforce_genmap')) {
+            $sf_donation = fundraiser_donation_get_donation($donation->did, TRUE);
+            salesforce_genmap_send_object_to_queue('fundraiser_sustainers', 'insert',
+              $sf_donation->node, $sf_donation->did, $sf_donation, 'recurring_donation');
+          }
+          $info = _fundraiser_get_donation_gateway($donation->did);
+          // This created donation is the master, so passing it in to create the set.
+          // We can't predict the form key for these values, so ask the gateway to provide.
+          if (isset($info['expire callback'])) {
+            $expiration_func = $info['expire callback'];
+            if (function_exists($expiration_func)) {
+              $expires = $expiration_func($donation->donation);
+              if (isset($expires['month']) && isset($expires['year'])) {
+                //_fundraiser_sustainers_create_future_orders($donation, $expires['month'], $expires['year']);
+                _fundraiser_sustainer_installments_create_future_orders($donation, $expires['month'], $expires['year']);
+              }
+            }
+          }
+        } else {
+          // ALERT: This gateway does it's own recurring stuff, so we skipped it here.
+          // But we should probably tell someone this was attempted.
+          watchdog('fundraiser_sustainers', 'A offsite recurring donation was created, for master donation id #@nid',
+            array('@nid'=> $donation->nid));
+        }
+      }
+      else {
+        // ALERT: This gateway does not support recurring stuff, so we skipped it here.
+        // But we should probably tell someone this was attempted. We have protections on the form, but they
+        // are JS based to hide the form element, so we check server side too.
+        watchdog('fundraiser_sustainers', 'A recurring donation for a non-recurring gateway was attempted, for master donation id #@nid',
+          array('@nid'=> $donation->nid));
+      }
+    }
+  }
+  else {
+    // And update the sustainer table.
+    db_query('UPDATE {fundraiser_sustainers} SET ' .
+      'gateway_resp = \'success\', attempts = attempts + 1 ' .
+      'WHERE did = :did', array(':did' => $donation->did)
+    );
+    // For all recurring when processed, check if we need to send a notice about the set almost done.
+    if (_fundraiser_sustainers_count_donations_recurr_remaining($donation->recurring->master_did) == 1) {
+      _fundraiser_sustainers_send_cc_notification($donation->recurring->master_did, $donation->uid);
+    }
+  }  
+  //fundraiser_sustainers_fundraiser_donation_success($donation);
+}
+
+/**
+ * Replacement logic to allow recurring intervals other than 'monthly'
+ */
+function _fundraiser_sustainer_installments_create_future_orders($donation, $month, $year) {
+  //TODO: replace the following two lines with data provided by hooks instead
+  $donation = fundraiser_donation_get_donation($donation->recurring->master_did, TRUE);//load the master donation and grab the selected installment frequency
+  $frequency = $donation->submission_data['period'];
+    // Handle the rest of the set based on the given donation.
+  //$start = strtotime("now");
+  //$stop = mktime(0, 0, 0, $month, 1, $year);
+  //$months = ((idate('Y', $stop) * 12) + idate('m', $stop)) - ((idate('Y', $start) * 12) + idate('m', $start));
+  //$processed_months = 0;
+  $sustainer_key = fundraiser_sustainers_get_sustainer_key_value();
+  //generate the date schedule up front and hand it off to the donation creation loop
+  $schedule = _fundraiser_sustainer_installments_get_payment_schedule($month, $year, $frequency);
+  // Start counting.
+  //$create_limit = variable_get('fundraiser_sustainers_create_limit', 50);//at most 50 entries (what about existing donations?)
+  // Get existing donations, if they exist.
+  $existing_recurring = _fundraiser_sustainers_get_donations_recurr_by_masterdid($donation->did);
+  unset($existing_recurring[0]); // 0 is the master, we don't need to count it.
+  //while ($processed_months < $months && $processed_months < $create_limit) {
+  foreach ($schedule as $index => $charge_date) {
+    //$processed_months++;
+    // Check if we have a donation for this next month.
+    if (!isset($existing_recurring[$index])) {
+      // Create a new one.
+      $new_donation = clone $donation;
+      $new_donation->sid = 0; // Not actually submitted, it's automated, so no sid.
+      // Create the new donation object, but do not process it. Processing doesn't occur till cron.
+      // New donation has all of the old donation information already loaded.
+      fundraiser_donation_create($new_donation);
+      $next_charge = $charge_date;
+      //$next_charge = strtotime('+ ' . $processed_months . ' months');
+      fundraiser_donation_comment($new_donation, 'Sustainer donation scheduled to be charged at @next_charge',
+        array('@next_charge' => format_date($next_charge)));
+      // After this, the donation did and donation data is set.
+      // The new donation object, with new did, needs to be saved to recurring so we can grab it later.
+      $recurring_donation = array(
+        'master_did' => $donation->did,
+        'did' => $new_donation->did,
+        'next_charge' => $next_charge,
+        'sustainer_key' => $sustainer_key,
+      );
+      // Update the recurring table.
+      _fundraiser_sustainers_create_recurring($recurring_donation);
+      // Load the newly created individual donation into salesforce_donation.
+      if (module_exists('salesforce_genmap')) {
+        $sf_donation = fundraiser_donation_get_donation($new_donation->did, TRUE);
+        salesforce_genmap_send_object_to_queue('salesforce_donation', 'insert',
+          $sf_donation->node, $sf_donation->did, $sf_donation, 'donation');
+      }
+    }
+    else {
+      // Unset this from the existing recurring.
+      // By the time this loop is done, only recurring outside of our range wills till be in the set.
+      unset($existing_recurring[$processed_months]); // This donation existed already, mark it off.
+    }
+  }
+
+  // Done with the loop, everything has been created that needs to be created.
+  // But now we need to remove anything that existed in the set beyond our expiration date.
+  global $user;
+  foreach ($existing_recurring as $key => $recurring) {
+    $this_donation = fundraiser_donation_get_donation($recurring->did);
+    // Cancel the donation with an informative message.
+    watchdog('fundraiser', 'Donation @id was deleted by @user while updating the card expiration date.',
+      array('@id' => $donation->did, '@user' => $user->name), WATCHDOG_DEBUG, NULL);
+    fundraiser_donation_delete($this_donation);
+  }
+}
+
+/**
+ * Helper function to generate date schedule for future recurring payments
+ *
+ * index by frequency time unit
+ * need 'first' start date and length in terms of frequency
+ * need total in terms of frequency
+ *
+ *
+ * monthly:
+ *   index: month
+ *   start date: now
+ *   total: 50 or months til expires
+ *
+ * quarterly:
+ *   index: month
+ *   start: now
+ *   total: 50 or months til expires
+ *
+ * yearly:
+ *   index: year
+ *   start date: now
+ *   total: ? not 50, years til expires is the most
+ *
+ * weekly:
+ *   index: week
+ *   start date: now
+ *   total: 50 or days/7 til expires
+ *
+ * 1st and 15th:
+ *   index: ?
+ *   start date: 1st
+ *   total: 2xmonths til expires or 50
+ */
+function _fundraiser_sustainer_installments_get_payment_schedule($month, $year, $frequency = 'monthly') {
+  $start = strtotime("now");
+  $stop = mktime(0, 0, 0, $month, 1, $year);
+  $months = ((idate('Y', $stop) * 12) + idate('m', $stop)) - ((idate('Y', $start) * 12) + idate('m', $start));
+  switch ($frequency) {
+    case 'monthly':
+      $interval = 'months';
+      $step = 1;
+      break;
+    case 'quarterly' :
+      $interval = 'months';
+      $step = 3;
+      break;
+    case 'yearly' :
+      $interval = 'years';
+      $step = 1;
+      $total_installments = $months/12;
+      break;
+    case 'weekly':
+      $interval = 'weeks';
+      $step = 1;
+      $total_installments = ($stop - $start)/(60*60*24*7);
+      break;
+    case 'bi_monthly':
+      $interval = 'months';
+      $step = 1;
+      $total_installments = $months;
+      break;
+    default:
+      $interval = 'months';
+      $step = 1;
+      $total_installments = 'months';
+  }
+  
+  
+  $create_limit = variable_get('fundraiser_sustainers_create_limit', 50);
+  $processed_installments = 0;
+  $max_installments = min($create_limit, $total_installments);
+  $schedule = array();
+  while ($processed_installments < $max_installments) {
+    $processed_installments += $step;
+    if ($frequency === 'bi_monthly') {
+      $schedule[$processed_installments] = strtotime('first day of +' . $processed_installments . ' months');
+      $processed_installments += $step;
+      $schedule[$processed_installments] = strtotime('+2 weeks', $schedule[$processed_installments - $step]);
+    }
+    else {
+      $schedule[$processed_installments] = strtotime('+ ' . $processed_installments . " $interval");
+    }
+  }
+  return $schedule;
+
+}
