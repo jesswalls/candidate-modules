@@ -191,6 +191,9 @@ function _fundraiser_sustainer_installments_create_future_orders($donation, $mon
   //TODO: replace the following two lines with data provided by hooks instead
   $donation = fundraiser_donation_get_donation($donation->recurring->master_did, TRUE);//load the master donation and grab the selected installment frequency
   $frequency = $donation->submission_data['period'];
+  if(empty($frequency)) {
+    return;//Not the most desirable way to handle this, but better than creating incorrect future orders
+  }
     // Handle the rest of the set based on the given donation.
   //$start = strtotime("now");
   //$stop = mktime(0, 0, 0, $month, 1, $year);
