@@ -318,7 +318,7 @@ function _fundraiser_sustainer_installments_get_payment_schedule($month, $year, 
     default:
       $interval = 'months';
       $step = 1;
-      $total_installments = 'months';
+      $total_installments = $months;
   }
   
   
